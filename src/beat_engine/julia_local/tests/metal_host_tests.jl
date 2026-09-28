@@ -49,6 +49,8 @@ end
         :assemble_burton_miller_neumann_system_metal,
         :release_metal_burton_miller_system!,
         :metal_host_operators,
+        :build_metal_field_evaluation_cache,
+        :evaluate_galerkin_field_metal,
     )
         @test isdefined(Engine, name)
     end
