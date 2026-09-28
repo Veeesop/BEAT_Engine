@@ -8,7 +8,20 @@ else
 end
 using .BeatEngineCore
 get_value(value, key, default) = get(value, key, default)
-include(joinpath(@__DIR__, "..", "deploy_solver.jl"))
+using JSON
+using Printf
+using Statistics
+using StaticArrays
+Base.include(@__MODULE__, joinpath(@__DIR__, "..", "BeatEngineDriver.jl"))
+
+@testset "Deploy Metal backend policy" begin
+    @test beat_backend_from_request(Dict("beat_engine_backend" => "metal")) === :metal
+    @test_throws ErrorException solve_deploy_request_impl(Dict(
+        "schema" => "boundary_lab_deploy_rom",
+        "beat_engine_backend" => "metal",
+        "frequency_hz" => 80,
+    ))
+end
 
 function fixture_model(directory, name, rank, nodes, faces, inputs, instances)
     shapes = Dict(
