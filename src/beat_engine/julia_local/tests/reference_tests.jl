@@ -1,6 +1,10 @@
 # Required CPU numerical extraction gate; no Boundary Lab imports or assets.
 using Test, StaticArrays, LinearAlgebra
 
+# The exact interior-resonance fixture is sensitive to threaded BLAS rounding.
+# Keep this standalone CPU reference gate reproducible across local and CI hosts.
+BLAS.set_num_threads(1)
+
 # This entrypoint deliberately runs the full references, regardless of ambient
 # opt-in settings. Accelerator qualification has separate hardware gates.
 ENV["BLAB_RUN_COUPLED_REFERENCE"] = "1"

@@ -36,6 +36,13 @@ function release_operator_storage!(operators::NamedTuple)
     return nothing
 end
 
+function release_operator_storage!(backing::NamedTuple{_METAL_OPERATOR_KEYS})
+    for key in _METAL_OPERATOR_KEYS
+        Metal.unsafe_free!(getfield(backing, key))
+    end
+    return nothing
+end
+
 function _apply_metal_operator_p1_row_weights!(operators, mesh::BoundaryMesh{T}, symmetry_mode) where {T<:AbstractFloat}
     normalized_symmetry_mode(symmetry_mode) == :off && return nothing
     d_weights = MtlArray(Complex{T}.(p1_symmetry_orbit_weights(mesh, symmetry_mode)))

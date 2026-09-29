@@ -14,6 +14,8 @@ function release_deploy_boundary_state!()
         cuda = BeatEngineCore.CUDA_MODULE
         state.pressure isa cuda.CuArray && cuda.unsafe_free!(state.pressure)
         state.q_neumann isa cuda.CuArray && cuda.unsafe_free!(state.q_neumann)
+    elseif state.backend == :metal
+        Bool(get(state, :shared_geometry, false)) || release_metal_field_evaluation_cache!(state.field_cache)
     end
     DEPLOY_BOUNDARY_STATE[] = nothing
     return nothing
@@ -40,6 +42,10 @@ function release_deploy_geometry_state!()
                 value isa cuda.CuArray && cuda.unsafe_free!(value)
             end
         end
+    elseif state.backend == :metal
+        state.device_singular_cache === nothing || release_metal_singular_correction_cache!(state.device_singular_cache)
+        state.device_cache === nothing || release_metal_regular_assembly_cache!(state.device_cache)
+        release_metal_field_evaluation_cache!(state.field_cache)
     end
     DEPLOY_GEOMETRY_STATE[] = nothing
     return nothing
@@ -555,7 +561,7 @@ function solve_deploy_request_impl(
     schema_version = Int(get_value(request, "schema_version", 1))
     schema_version in (1, 2, 3) || error("Unsupported Deploy solve schema_version $(schema_version).")
     beat_backend = beat_backend_from_request(request)
-    beat_backend in (:cuda, :cpu) || error("Deploy Level 2 currently supports BEAT CUDA or CPU.")
+    beat_backend in (:cuda, :cpu, :metal) || error("Deploy Level 2 currently supports BEAT CUDA, CPU, or Metal.")
     requested_assembly_mode = lowercase(String(get_value(request, "burton_miller_assembly", "direct_system")))
     requested_assembly_mode in ("direct_system", "operator_matrices") || error(
         "Deploy burton_miller_assembly must be 'direct_system' or 'operator_matrices'.",
@@ -563,6 +569,9 @@ function solve_deploy_request_impl(
     direct_cuda_assembly = beat_backend == :cuda && requested_assembly_mode == "direct_system"
     rom_request && beat_backend == :cuda && !direct_cuda_assembly && error(
         "Deploy Level 3 CUDA requires direct-system assembly.",
+    )
+    rom_request && beat_backend == :metal && error(
+        "Deploy Level 3 parity ROM currently requires the CPU or CUDA backend.",
     )
     assembly_mode = direct_cuda_assembly ? "direct_system" : "operator_matrices"
     retain_geometry_cache = Bool(get_value(request, "retain_geometry_cache", false))
@@ -832,34 +841,23 @@ function solve_deploy_request_impl(
                     field_cache = build_cuda_field_evaluation_cache(cpu_field_cache)
                 end
                 cached_q_neumann = BeatEngineCore.CUDA_MODULE.CuArray(q_neumann)
+            elseif beat_backend == :metal
+                if cached_geometry === nothing
+                    emit_event("status"; message="Preparing BEAT Metal geometry caches")
+                    device_cache = build_metal_regular_assembly_cache(
+                        mesh,
+                        p1_space,
+                        dp0_space,
+                        rule;
+                        singular_order=singular_order,
+                        symmetry_mode=:ground,
+                    )
+                    device_singular_cache = build_metal_singular_correction_cache(singular_cache)
+                    field_cache = build_metal_field_evaluation_cache(cpu_field_cache)
+                end
             else
                 cached_geometry === nothing && emit_event("status"; message="Preparing BEAT CPU geometry caches")
             end
-        end
-
-        if retain_geometry_cache && cached_geometry === nothing
-            DEPLOY_GEOMETRY_STATE[] = (
-                key=geometry_key,
-                backend=beat_backend,
-                assembly_mode=assembly_mode,
-                mesh=mesh,
-                p1_space=p1_space,
-                dp0_space=dp0_space,
-                rule=rule,
-                identity_p1_p1=identity_p1_p1,
-                identity_p1_dp0=identity_p1_dp0,
-                singular_cache=singular_cache,
-                near_correction_cache=near_correction_cache,
-                ground_near_correction_cache=ground_near_correction_cache,
-                cpu_field_cache=cpu_field_cache,
-                device_cache=device_cache,
-                device_singular_cache=device_singular_cache,
-                device_image_singular_cache=device_image_singular_cache,
-                device_near_correction_cache=device_near_correction_cache,
-                device_ground_near_correction_cache=device_ground_near_correction_cache,
-                cuda_identity_cache=cuda_identity_cache,
-                field_cache=field_cache,
-            )
         end
 
         assembly_message = rom_request ?
@@ -887,6 +885,61 @@ function solve_deploy_request_impl(
                     symmetry_mode=:ground,
                     timing=direct_assembly_timings,
                 )
+            elseif beat_backend == :metal
+                # Metal's fused Burton-Miller path does not yet include Deploy's
+                # close-pair corrections. Assemble its four operators on Metal,
+                # then apply the established CPU correction routine to the
+                # shared-memory host views before the host dense solve.
+                operators = assemble_regular_galerkin_operators(
+                    mesh,
+                    p1_space,
+                    dp0_space,
+                    k,
+                    rule;
+                    skip_singular=false,
+                    singular_order=singular_order,
+                    backend=:metal,
+                    device_cache=device_cache,
+                    return_device=true,
+                    accelerator_quadrature=true,
+                    singular_cache=singular_cache,
+                    device_singular_cache=device_singular_cache,
+                    symmetry_mode=:ground,
+                )
+                operators = metal_host_operators(operators)
+                near_cpu_cache = build_beat_cpu_assembly_cache(
+                    mesh,
+                    p1_space,
+                    dp0_space,
+                    rule;
+                    singular_order=singular_order,
+                    symmetry_mode=:ground,
+                )
+                near_corrections = (
+                    single_layer=zeros(Complex{FloatType}, p1_space.global_dof_count, dp0_space.global_dof_count),
+                    double_layer=zeros(Complex{FloatType}, p1_space.global_dof_count, p1_space.global_dof_count),
+                    adjoint_double_layer=zeros(Complex{FloatType}, p1_space.global_dof_count, dp0_space.global_dof_count),
+                    hypersingular=zeros(Complex{FloatType}, p1_space.global_dof_count, p1_space.global_dof_count),
+                )
+                for near_cache in (near_correction_cache, ground_near_correction_cache)
+                    near_cache.pair_count == 0 && continue
+                    BeatEngineCore._beat_cpu_apply_near_cache!(
+                        near_corrections,
+                        mesh,
+                        near_cpu_cache.elements,
+                        near_cpu_cache.indices,
+                        BeatEngineCore._beat_cpu_element_color_groups(mesh, near_cpu_cache.indices),
+                        Threads.nthreads() > 1,
+                        k,
+                        near_cpu_cache.regular_quadrature,
+                        near_cache,
+                    )
+                end
+                BeatEngineCore._beat_cpu_apply_operator_p1_row_weights!(near_corrections, mesh, :ground)
+                for name in (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
+                    getproperty(operators, name) .+= getproperty(near_corrections, name)
+                end
+                cached_q_neumann = copy(q_neumann)
             else
                 operators = assemble_regular_galerkin_operators(
                     mesh,
@@ -1169,6 +1222,8 @@ function solve_deploy_request_impl(
                     k;
                     return_gpu=true,
                 )
+            elseif beat_backend == :metal
+                solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, cached_q_neumann, k)
             else
                 cached_q_neumann = copy(q_neumann)
                 solve_burton_miller_neumann(operators, identity_p1_p1, identity_p1_dp0, q_neumann, k)
@@ -1202,6 +1257,16 @@ function solve_deploy_request_impl(
                         weighted_sources=weighted_sources,
                     )
                 end
+            elseif beat_backend == :metal
+                field_pressure = evaluate_galerkin_field_metal(
+                    observation_points,
+                    mesh,
+                    pressure,
+                    cached_q_neumann,
+                    k,
+                    field_cache,
+                )
+                spl_db = pressure_to_spl(field_pressure, FloatType)
             else
                 field_pressure = field_for_points(
                     observation_points,
@@ -1217,20 +1282,6 @@ function solve_deploy_request_impl(
         end
         solution_key = String(get_value(request, "solution_key", ""))
         isempty(solution_key) && error("Deploy Level 2 solve requires a boundary solution key.")
-        release_deploy_boundary_state!()
-        DEPLOY_BOUNDARY_STATE[] = (
-            solution_key=solution_key,
-            phasor_convention=phasor_convention(),
-            backend=beat_backend,
-            frequency=frequency,
-            wavenumber=k,
-            mesh=mesh,
-            pressure=pressure,
-            q_neumann=cached_q_neumann,
-            field_cache=field_cache,
-            weighted_sources=weighted_sources,
-            shared_geometry=retain_geometry_cache,
-        )
         result = nothing
         postprocess_seconds = @elapsed begin
             diagnostic_pressure = beat_backend == :cuda ? Complex{FloatType}.(Array(pressure)) : pressure
@@ -1287,7 +1338,7 @@ function solve_deploy_request_impl(
                     "close_pair_count" => close_pair_count,
                     "surface_padding_m" => Float32(get_value(proximity, "surface_padding_m", 0.01)),
                     "field_only" => false,
-                    "gpu_resident_field" => beat_backend == :cuda,
+                    "gpu_resident_field" => beat_backend in (:cuda, :metal),
                     "fidelity" => rom_request ? "level3_parity_petrov_galerkin" : "level2",
                 ),
             )
@@ -1389,9 +1440,53 @@ function solve_deploy_request_impl(
             end
         end
         emit_event("result"; result=result)
+        if retain_geometry_cache && cached_geometry === nothing
+            DEPLOY_GEOMETRY_STATE[] = (
+                key=geometry_key,
+                backend=beat_backend,
+                assembly_mode=assembly_mode,
+                mesh=mesh,
+                p1_space=p1_space,
+                dp0_space=dp0_space,
+                rule=rule,
+                identity_p1_p1=identity_p1_p1,
+                identity_p1_dp0=identity_p1_dp0,
+                singular_cache=singular_cache,
+                near_correction_cache=near_correction_cache,
+                ground_near_correction_cache=ground_near_correction_cache,
+                cpu_field_cache=cpu_field_cache,
+                device_cache=device_cache,
+                device_singular_cache=device_singular_cache,
+                device_image_singular_cache=device_image_singular_cache,
+                device_near_correction_cache=device_near_correction_cache,
+                device_ground_near_correction_cache=device_ground_near_correction_cache,
+                cuda_identity_cache=cuda_identity_cache,
+                field_cache=field_cache,
+            )
+        end
+        # Publish the reusable field only after result construction succeeds. If
+        # evaluation or post-processing throws, the previous boundary result
+        # remains valid and this solve's Metal cache stays locally owned for the
+        # cleanup path below.
+        release_deploy_boundary_state!()
+        DEPLOY_BOUNDARY_STATE[] = (
+            solution_key=solution_key,
+            phasor_convention=phasor_convention(),
+            backend=beat_backend,
+            frequency=frequency,
+            wavenumber=k,
+            mesh=mesh,
+            pressure=pressure,
+            q_neumann=cached_q_neumann,
+            field_cache=field_cache,
+            weighted_sources=weighted_sources,
+            shared_geometry=retain_geometry_cache,
+        )
     finally
         cuda_observation === nothing || release_cuda_observation_points!(cuda_observation)
-        operators === nothing || release_operator_storage!(operators)
+        if operators !== nothing
+            release_operator_storage!(operators)
+        end
         (direct_system === nothing || direct_system_consumed) ||
             release_burton_miller_system_cuda!(direct_system)
         if rom_factorization !== nothing
@@ -1403,8 +1498,18 @@ function solve_deploy_request_impl(
         retained_state = DEPLOY_GEOMETRY_STATE[]
         geometry_resources_retained = retain_geometry_cache && retained_state !== nothing &&
             retained_state.field_cache === field_cache
+        boundary_state = DEPLOY_BOUNDARY_STATE[]
+        boundary_resources_retained = boundary_state !== nothing && boundary_state.field_cache === field_cache
         if !geometry_resources_retained
+            if beat_backend == :metal && !boundary_resources_retained &&
+               field_cache isa BeatEngineCore.MetalFieldEvaluationCache
+                release_metal_field_evaluation_cache!(field_cache)
+            end
             cuda_identity_cache === nothing || release_cuda_burton_miller_identity_cache!(cuda_identity_cache)
+            if beat_backend == :metal
+                device_singular_cache === nothing || release_metal_singular_correction_cache!(device_singular_cache)
+                device_cache === nothing || release_metal_regular_assembly_cache!(device_cache)
+            end
             device_image_singular_cache === nothing ||
                 release_cuda_image_singular_correction_cache!(device_image_singular_cache)
             device_near_correction_cache === nothing ||
@@ -1577,6 +1682,16 @@ function evaluate_deploy_field_request_impl(request)
                         weighted_sources=state.weighted_sources,
                     )
                 end
+            elseif beat_backend == :metal
+                field_pressure = evaluate_galerkin_field_metal(
+                    observation_points,
+                    state.mesh,
+                    state.pressure,
+                    state.q_neumann,
+                    state.wavenumber,
+                    state.field_cache,
+                )
+                spl_db = pressure_to_spl(field_pressure, FloatType)
             else
                 field_pressure = field_for_points(
                     observation_points,
@@ -1616,7 +1731,7 @@ function evaluate_deploy_field_request_impl(request)
             "node_count" => length(state.mesh.vertices),
             "face_count" => length(state.mesh.faces),
             "field_only" => true,
-            "gpu_resident_field" => beat_backend == :cuda,
+            "gpu_resident_field" => beat_backend in (:cuda, :metal),
             "gpu_generated_observation" => cuda_observation !== nothing,
             "exterior_domain" => "rigid_y0_half_space",
         ),
