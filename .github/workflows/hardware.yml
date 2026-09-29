@@ -13,15 +13,11 @@ jobs:
       BEAT_BACKEND: ${{ inputs.backend }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          # A runner may execute under a nonstandard user/home directory.
-          # Put setup-python's toolcache under RUNNER_TEMP rather than
-          # assuming the machine has a writable /Users/runner path.
-          check-latest: false
-        env:
-          RUNNER_TOOL_CACHE: ${{ runner.temp }}/toolcache
+      - name: Create isolated Python environment
+        shell: bash
+        run: |
+          python3.11 -m venv "$RUNNER_TEMP/beat-qualification-venv"
+          echo "$RUNNER_TEMP/beat-qualification-venv/bin" >> "$GITHUB_PATH"
       - run: python -m pip install -e .
       - run: python -m beat_engine instantiate --backend ${{ inputs.backend }}
       - run: python scripts/qualify_accelerator.py
